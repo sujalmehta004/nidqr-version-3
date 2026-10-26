@@ -137,6 +137,11 @@ module.exports = async function handler(req, res) {
     return res.json(responseBody);
   } catch (error) {
     console.error("OTP request error:", error);
+    if (error.code === "ENETUNREACH") {
+      return res.status(503).json({
+        error: "The OTP provider is currently unreachable from the application server. Please try again later."
+      });
+    }
     return res.status(500).json({ error: `OTP request failed: ${error.message}` });
   }
 };

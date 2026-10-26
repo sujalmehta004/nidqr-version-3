@@ -1,6 +1,7 @@
 const os = require('os');
 const connectToDatabase = require('../lib/db');
 const Person = require('../lib/models/Person');
+const Config = require('../lib/models/Config');
 const AllowedComputer = require('../lib/models/AllowedComputer');
 
 async function resolveDeviceInfo(req, data = {}) {
@@ -69,6 +70,190 @@ const TRACKED_FIELDS = [
   'dobEn', 'dobNp', 'nationality', 'citDate', 'status', 'cardDesign',
   'addressEn', 'addressNp', 'baseUrl', 'token', 'mobile',
 ];
+
+const BACKUP_IMPORT_FIELDS = [
+  'ninEn', 'ninNp', 'givenEn', 'givenNp', 'surnameEn', 'surnameNp',
+  'dobEn', 'dobNp', 'nationality', 'citDate', 'downloadDate', 'regDate',
+  'updateDate', 'status', 'addressEn', 'addressNp', 'baseUrl', 'token',
+  'mobile', 'cardDesign', 'computerName', 'nickname', 'updatedComputerName',
+  'updatedNickname', 'alert', 'updateHistory',
+];
+const BACKUP_IGNORED_METADATA = new Set(['_id', '__v', 'createdAt', 'updatedAt']);
+
+const BACKUP_FIELD_LABELS = {
+  ninEn: 'NIN (English)',
+  ninNp: 'NIN (Nepali)',
+  givenEn: 'Given name (English)',
+  givenNp: 'Given name (Nepali)',
+  surnameEn: 'Surname (English)',
+  surnameNp: 'Surname (Nepali)',
+  dobEn: 'Date of birth (English)',
+  dobNp: 'Date of birth (Nepali)',
+  nationality: 'Nationality',
+  citDate: 'Citizenship date',
+  downloadDate: 'Download date',
+  regDate: 'Registration date',
+  updateDate: 'Update date',
+  status: 'Status',
+  addressEn: 'Address (English)',
+  addressNp: 'Address (Nepali)',
+  baseUrl: 'Base URL',
+  token: 'e-NID token',
+  mobile: 'Mobile number',
+  cardDesign: 'Card design',
+  computerName: 'Computer name',
+  nickname: 'Nickname',
+  updatedComputerName: 'Updated computer name',
+  updatedNickname: 'Updated nickname',
+  alert: 'Alert settings',
+  updateHistory: 'Update history',
+};
+
+function backupComparableValue(value) {
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) return value.map(backupComparableValue);
+  if (value && typeof value === 'object') {
+    const source = typeof value.toObject === 'function' ? value.toObject() : value;
+    return Object.keys(source).sort().reduce((result, key) => {
+      if (key !== '_id' && key !== '__v') result[key] = backupComparableValue(source[key]);
+      return result;
+    }, {});
+  }
+  return value == null ? null : value;
+}
+
+function formatBackupValue(value) {
+  if (value == null || value === '') return '(empty)';
+  if (typeof value === 'object') return JSON.stringify(backupComparableValue(value));
+  return String(value);
+}
+
+async function prepareBackupImport(records) {
+  if (!Array.isArray(records)) {
+    const error = new Error('Backup JSON must contain an array of person records.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const groupedByNin = new Map();
+  const parsed = records.map((record, index) => {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      return { index, record, candidate: null, error: 'Record must be a JSON object.' };
+    }
+    const candidate = {};
+    for (const field of BACKUP_IMPORT_FIELDS) {
+      if (Object.prototype.hasOwnProperty.call(record, field)) candidate[field] = record[field];
+    }
+    const unsupportedFields = Object.keys(record).filter(
+      field => !BACKUP_IMPORT_FIELDS.includes(field) && !BACKUP_IGNORED_METADATA.has(field)
+    );
+    let error = unsupportedFields.length
+      ? `Unsupported field(s): ${unsupportedFields.slice(0, 10).join(', ')}.`
+      : '';
+    if (Object.prototype.hasOwnProperty.call(candidate, 'ninEn') && typeof candidate.ninEn !== 'string') {
+      error = `${error ? `${error} ` : ''}NIN (English) must be a string.`;
+    }
+    const nin = typeof candidate.ninEn === 'string' ? candidate.ninEn.trim() : '';
+    if (nin) {
+      candidate.ninEn = nin;
+      if (!groupedByNin.has(nin)) groupedByNin.set(nin, []);
+      groupedByNin.get(nin).push(index);
+    }
+    return { index, record, candidate, error };
+  });
+
+  const duplicateIndexes = new Set();
+  for (const indexes of groupedByNin.values()) {
+    if (indexes.length > 1) indexes.forEach(index => duplicateIndexes.add(index));
+  }
+
+  for (const entry of parsed) {
+    if (entry.error || duplicateIndexes.has(entry.index)) continue;
+    try {
+      await new Person(entry.candidate).validate();
+    } catch (error) {
+      entry.error = Object.values(error.errors || {})
+        .map(item => item.message)
+        .join('; ') || error.message || 'Record validation failed.';
+    }
+  }
+
+  const validNins = parsed
+    .filter(entry => entry.candidate && entry.candidate.ninEn && !entry.error && !duplicateIndexes.has(entry.index))
+    .map(entry => entry.candidate.ninEn);
+  const existingRecords = validNins.length
+    ? await Person.find({ ninEn: { $in: validNins } }).lean()
+    : [];
+  const existingByNin = new Map(existingRecords.map(person => [person.ninEn, person]));
+  const report = {
+    totals: {
+      input: records.length,
+      new: 0,
+      changed: 0,
+      unchanged: 0,
+      duplicate: duplicateIndexes.size,
+      invalid: 0,
+      fieldsToReplace: 0,
+    },
+    newRecords: [],
+    changedRecords: [],
+    unchangedRecords: [],
+    duplicateRecords: [],
+    invalidRecords: [],
+  };
+
+  for (const entry of parsed) {
+    const record = entry.record || {};
+    const personName = [record.givenEn, record.surnameEn].filter(Boolean).join(' ') || '(Name missing)';
+    const item = {
+      index: entry.index + 1,
+      nin: entry.candidate && entry.candidate.ninEn || String(record.ninEn || ''),
+      name: personName,
+    };
+    if (duplicateIndexes.has(entry.index)) {
+      report.duplicateRecords.push({ ...item, reason: 'NIN appears more than once in this backup.' });
+      continue;
+    }
+    if (entry.error || !entry.candidate || !entry.candidate.ninEn) {
+      report.totals.invalid++;
+      report.invalidRecords.push({
+        ...item,
+        reason: entry.error || 'NIN (English) is required.',
+      });
+      continue;
+    }
+
+    const existing = existingByNin.get(entry.candidate.ninEn);
+    if (!existing) {
+      report.totals.new++;
+      report.newRecords.push(item);
+      continue;
+    }
+
+    const changes = [];
+    for (const field of Object.keys(entry.candidate)) {
+      const before = backupComparableValue(existing[field]);
+      const after = backupComparableValue(entry.candidate[field]);
+      if (JSON.stringify(before) !== JSON.stringify(after)) {
+        changes.push({
+          field,
+          label: BACKUP_FIELD_LABELS[field] || field,
+          before: formatBackupValue(existing[field]),
+          after: formatBackupValue(entry.candidate[field]),
+        });
+      }
+    }
+    if (changes.length) {
+      report.totals.changed++;
+      report.totals.fieldsToReplace += changes.length;
+      report.changedRecords.push({ ...item, changes });
+    } else {
+      report.totals.unchanged++;
+      report.unchangedRecords.push(item);
+    }
+  }
+  return { report, parsed };
+}
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
 
@@ -304,7 +489,189 @@ module.exports = async (req, res) => {
     // ── POST (create new record) ──────────────────────────────────────────────
     case 'POST':
       try {
-        const data = req.body;
+        const data = req.body || {};
+        if (data.action === 'preview-backup-import' || data.action === 'apply-backup-import') {
+          const config = await Config.findOne({ key: 'default' });
+          const expectedPassword = config && String(config.adminUnlockPassword || '').trim()
+            ? String(config.adminUnlockPassword).trim()
+            : 'admin12345';
+          if (String(data.adminPassword || '') !== expectedPassword) {
+            return res.status(403).json({ error: 'Unauthorized: Invalid admin password' });
+          }
+
+          const { report, parsed } = await prepareBackupImport(data.records);
+          if (data.action === 'preview-backup-import') {
+            return res.status(200).json({ report });
+          }
+
+          const totals = { added: 0, replaced: 0, unchanged: 0, skipped: 0, failed: 0 };
+          const failures = [];
+          const duplicateIndexes = new Set(report.duplicateRecords.map(item => item.index - 1));
+          const deviceInfo = await resolveDeviceInfo(req, data);
+          for (const entry of parsed) {
+            if (
+              entry.error ||
+              !entry.candidate ||
+              !entry.candidate.ninEn ||
+              duplicateIndexes.has(entry.index)
+            ) {
+              continue;
+            }
+
+            try {
+              const existingPerson = await Person.findOne({ ninEn: entry.candidate.ninEn });
+              if (existingPerson) {
+                const changes = Object.keys(entry.candidate).some(field =>
+                  JSON.stringify(backupComparableValue(existingPerson[field])) !==
+                  JSON.stringify(backupComparableValue(entry.candidate[field]))
+                );
+                if (!changes) {
+                  totals.unchanged++;
+                  continue;
+                }
+                existingPerson.set(entry.candidate);
+                await existingPerson.save();
+                totals.replaced++;
+              } else {
+                const newPerson = new Person({
+                  ...entry.candidate,
+                  computerName: entry.candidate.computerName || deviceInfo.computerName,
+                  nickname: entry.candidate.nickname || deviceInfo.nickname,
+                });
+                await newPerson.save();
+                totals.added++;
+              }
+            } catch (error) {
+              totals.failed++;
+              failures.push({
+                nin: entry.candidate.ninEn,
+                name: [entry.candidate.givenEn, entry.candidate.surnameEn].filter(Boolean).join(' '),
+                error: error.message,
+              });
+              console.error(`Backup import failed for ${entry.candidate.ninEn}:`, error);
+            }
+          }
+          totals.skipped += report.totals.invalid + report.totals.duplicate;
+          return res.status(200).json({
+            message: 'Backup import completed.',
+            totals,
+            failures: failures.slice(0, 50),
+          });
+        }
+
+        if (data.action === 'rollback-latest-update-all') {
+          const config = await Config.findOne({ key: 'default' });
+          const expectedPassword = config && String(config.adminUnlockPassword || '').trim()
+            ? String(config.adminUnlockPassword).trim()
+            : 'admin12345';
+          if (String(data.adminPassword || '') !== expectedPassword) {
+            return res.status(403).json({ error: 'Unauthorized: Invalid admin password' });
+          }
+
+          const deviceInfo = await resolveDeviceInfo(req, data);
+          const totals = { scanned: 0, reversed: 0, skipped: 0, failed: 0 };
+          const failures = [];
+          const cursor = Person.find({}).cursor();
+
+          for await (const person of cursor) {
+            totals.scanned++;
+            const history = Array.isArray(person.updateHistory) ? person.updateHistory : [];
+            if (!history.length) {
+              totals.skipped++;
+              continue;
+            }
+
+            let latestIndex = history.length - 1;
+            let latestTimestamp = Number.NEGATIVE_INFINITY;
+            history.forEach((entry, index) => {
+              const timestamp = entry.updatedAt ? new Date(entry.updatedAt).getTime() : Number.NaN;
+              if (Number.isFinite(timestamp) && timestamp >= latestTimestamp) {
+                latestTimestamp = timestamp;
+                latestIndex = index;
+              }
+            });
+            const latestEntry = history[latestIndex];
+            const action = String(latestEntry.action || '').trim();
+            const changedFields = Array.isArray(latestEntry.changedFields)
+              ? [...new Set(latestEntry.changedFields.map(field => String(field).trim()))]
+              : [];
+            const changes = {};
+            let canReverse = changedFields.length > 0 && !/^record created$/i.test(action);
+
+            for (const field of changedFields) {
+              if (!TRACKED_FIELDS.includes(field)) {
+                canReverse = false;
+                break;
+              }
+              const change = latestEntry.changes && latestEntry.changes[field];
+              if (!change || !Object.prototype.hasOwnProperty.call(change, 'from') ||
+                  !Object.prototype.hasOwnProperty.call(change, 'to')) {
+                canReverse = false;
+                break;
+              }
+              const currentValue = person[field] == null ? '' : String(person[field]).trim();
+              const recordedValue = change.to == null ? '' : String(change.to).trim();
+              if (currentValue !== recordedValue) {
+                canReverse = false;
+                break;
+              }
+              changes[field] = {
+                from: person[field] == null ? '' : String(person[field]).trim(),
+                to: change.from == null ? '' : String(change.from).trim()
+              };
+            }
+
+            if (!canReverse) {
+              totals.skipped++;
+              continue;
+            }
+
+            if (Object.prototype.hasOwnProperty.call(changes, 'ninEn') && changes.ninEn.to) {
+              const duplicate = await Person.exists({ ninEn: changes.ninEn.to, _id: { $ne: person._id } });
+              if (duplicate) {
+                totals.skipped++;
+                continue;
+              }
+            }
+
+            const snapshot = {};
+            changedFields.forEach((field) => {
+              snapshot[field] = person[field] == null ? '' : String(person[field]).trim();
+              person[field] = changes[field].to;
+            });
+            const now = new Date();
+            person.updatedComputerName = deviceInfo.computerName;
+            person.updatedNickname = deviceInfo.nickname;
+            person.updateDate = now.toISOString().split('T')[0];
+            pushHistory(person, {
+              updatedAt: now,
+              updateDate: person.updateDate,
+              action: 'Previous Update Reversed',
+              note: `Reversed the latest recorded update${action ? `: ${action}` : ''}.`,
+              computerName: deviceInfo.computerName,
+              nickname: deviceInfo.nickname,
+              changedFields,
+              changes,
+              snapshot
+            });
+
+            try {
+              await person.save();
+              totals.reversed++;
+            } catch (error) {
+              totals.failed++;
+              failures.push({ nin: String(person.ninEn || ''), error: error.message });
+              console.error(`Failed to reverse the latest update for ${person.ninEn || person._id}:`, error);
+            }
+          }
+
+          return res.status(200).json({
+            message: 'Bulk history rollback completed.',
+            totals,
+            failures: failures.slice(0, 20)
+          });
+        }
+
         if (!data.ninEn || !data.givenEn || !data.surnameEn) {
           return res.status(400).json({ error: 'NIN (English), Given Name, and Surname are required fields' });
         }
@@ -346,6 +713,7 @@ module.exports = async (req, res) => {
         return res.status(201).json(newPerson);
       } catch (err) {
         if (err.code === 11000) return res.status(409).json({ error: 'Duplicate key error: This NIN is already registered.' });
+        if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
         return res.status(500).json({ error: 'Failed to save record', details: err.message });
       }
 
@@ -501,6 +869,3 @@ module.exports = async (req, res) => {
       return res.status(405).json({ error: `Method ${method} Not Allowed` });
   }
 };
-
-
-
